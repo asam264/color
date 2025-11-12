@@ -35,8 +35,8 @@ func (t *HTTPTransport) getTransport() *http.Transport {
 		t.transport = &http.Transport{
 			Proxy:                 http.ProxyFromEnvironment,
 			DialContext:           dialer.DialContext,
-			MaxIdleConns:          50,
-			MaxIdleConnsPerHost:   5,
+			MaxIdleConns:          1000,
+			MaxIdleConnsPerHost:   200,
 			IdleConnTimeout:       30 * time.Second,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ExpectContinueTimeout: 1 * time.Second,
@@ -67,6 +67,8 @@ func (t *HTTPTransport) Proxy(ctx context.Context, target string, req *http.Requ
 		r.Host = targetURL.Host
 		// 使用传入的 context，确保超时控制
 		*r = *r.WithContext(ctx)
+		// 明确允许连接复用
+		r.Close = false
 	}
 
 	// 使用共享的 Transport，支持连接复用
