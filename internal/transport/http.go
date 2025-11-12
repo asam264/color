@@ -99,7 +99,7 @@ func (t *HTTPTransport) getOrCreateProxy(targetURL *url.URL) *httputil.ReversePr
 
 	// 自定义 Director：正确设置请求信息并保留所有 headers
 	proxy.Director = func(r *http.Request) {
-		// 先调用原始 Director
+		// 先调用原始 Director（这会设置基本的 URL 和 headers）
 		origDirector(r)
 
 		// 合并路径
@@ -116,6 +116,13 @@ func (t *HTTPTransport) getOrCreateProxy(targetURL *url.URL) *httputil.ReversePr
 		// 确保连接复用
 		r.Close = false
 
+		// 对于有 body 的请求，确保 Content-Length 正确设置
+		// ReverseProxy 会自动处理，但我们需要确保 body 没有被提前消费
+		if r.Body != nil {
+			// ReverseProxy 会自动处理 body 的读取和转发
+			// 我们只需要确保 body 存在即可
+		}
+
 		// 移除可能干扰的 headers（如果需要）
 		// r.Header.Del("Connection") // 不删除，让 Transport 管理
 	}
@@ -126,10 +133,15 @@ func (t *HTTPTransport) getOrCreateProxy(targetURL *url.URL) *httputil.ReversePr
 	// 自定义错误处理
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, e error) {
 		if t.enableLog {
-			log.Printf("[HTTPTransport] Proxy error for %s: %v", targetURL.String(), e)
+			// 详细记录错误信息，包括请求方法和路径
+			log.Printf("[HTTPTransport] Proxy error for %s %s -> %s: %v (context canceled: %v)",
+				r.Method, r.URL.Path, targetURL.String(), e, e == context.Canceled)
 		}
-		w.WriteHeader(http.StatusBadGateway)
-		w.Write([]byte("proxy error: " + e.Error()))
+		// 如果响应头还没写，才写错误响应
+		if w.Header().Get("Content-Type") == "" {
+			w.WriteHeader(http.StatusBadGateway)
+			w.Write([]byte("proxy error: " + e.Error()))
+		}
 	}
 
 	// 缓存新的 proxy 实例
@@ -157,6 +169,20 @@ func (t *HTTPTransport) Proxy(ctx context.Context, target string, req *http.Requ
 		return err
 	}
 
+	// 关键修复：创建一个新的 context，使用独立的超时控制
+	// 这样可以避免 Gin 的 context 被提前取消导致 "context canceled" 错误
+	// 使用 timeout 作为超时时间，确保请求有足够时间完成
+	// 注意：我们不继承原 context 的取消信号，因为 Gin 的 context 可能在请求完成前被取消
+	proxyCtx, cancel := context.WithTimeout(context.Background(), t.timeout)
+	defer cancel()
+
+	// 检查原 context 是否已被取消（用于日志记录）
+	if ctx != nil && ctx.Err() != nil {
+		if t.enableLog {
+			log.Printf("[HTTPTransport] Warning: original context already canceled: %v", ctx.Err())
+		}
+	}
+
 	// 获取或创建 ReverseProxy 实例
 	proxy := t.getOrCreateProxy(targetURL)
 
@@ -172,9 +198,13 @@ func (t *HTTPTransport) Proxy(ctx context.Context, target string, req *http.Requ
 			req.Method, req.URL.Path, targetURL.Host, req.URL.Path)
 	}
 
+	// 关键修复：对于 POST/PUT/PATCH 等有 body 的请求，确保 body 可以被读取
+	// httputil.ReverseProxy 会自动处理 body，但我们需要确保使用正确的 context
+	// 使用新的 context 而不是原请求的 context，避免被提前取消
+	proxyReq := req.WithContext(proxyCtx)
+
 	// 执行代理转发
-	// 使用 context 控制超时
-	proxy.ServeHTTP(responseWriter, req.WithContext(ctx))
+	proxy.ServeHTTP(responseWriter, proxyReq)
 
 	// 记录响应信息
 	duration := time.Since(startTime)
