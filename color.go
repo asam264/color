@@ -2,7 +2,9 @@ package color
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"net"
 	"sync"
 	"time"
 
@@ -130,12 +132,48 @@ func WithTTL(ttl time.Duration) Option {
 // WithAutoRegister 启用自动注册
 func WithAutoRegister(color, address, token, owner string) Option {
 	return func(c *Config) {
-		c.AutoRegister = true
-		c.LocalColor = color
-		c.LocalAddress = address
-		c.LocalToken = token
-		c.LocalOwner = owner
+		// 只有在 color 和 address 都不为空时才启用
+		if color != "" && address != "" {
+			// 如果 address 只是端口号，自动获取本机 IP
+			if !isFullURL(address) {
+				localIP := getLocalIPv4()
+				if localIP != "" {
+					address = fmt.Sprintf("http://%s:%s", localIP, address)
+				} else {
+					c.Logger.Error("failed to get local IP, auto register disabled")
+					return
+				}
+			}
+
+			c.AutoRegister = true
+			c.LocalColor = color
+			c.LocalAddress = address
+			c.LocalToken = token
+			c.LocalOwner = owner
+		}
 	}
+}
+
+// isFullURL 判断是否是完整 URL
+func isFullURL(addr string) bool {
+	return len(addr) > 7 && (addr[:7] == "http://" || addr[:8] == "https://")
+}
+
+// getLocalIPv4 获取本机非回环 IPv4 地址
+func getLocalIPv4() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return ""
+	}
+
+	for _, addr := range addrs {
+		if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() {
+			if ipNet.IP.To4() != nil {
+				return ipNet.IP.String()
+			}
+		}
+	}
+	return ""
 }
 
 // WithLogger 自定义日志
