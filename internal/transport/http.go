@@ -2,14 +2,18 @@ package transport
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sync"
 	"time"
 )
 
 type HTTPTransport struct {
-	timeout time.Duration
+	timeout   time.Duration
+	transport *http.Transport
+	once      sync.Once
 }
 
 func NewHTTPTransport(timeout time.Duration) *HTTPTransport {
@@ -17,6 +21,28 @@ func NewHTTPTransport(timeout time.Duration) *HTTPTransport {
 		timeout = 30 * time.Second
 	}
 	return &HTTPTransport{timeout: timeout}
+}
+
+// getTransport 获取共享的 http.Transport 实例，配置连接池参数
+func (t *HTTPTransport) getTransport() *http.Transport {
+	t.once.Do(func() {
+		t.transport = &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   10,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			ResponseHeaderTimeout: t.timeout,
+			DisableKeepAlives:     false,
+			ForceAttemptHTTP2:     false,
+		}
+	})
+	return t.transport
 }
 
 func (t *HTTPTransport) Proxy(ctx context.Context, target string, req *http.Request, w http.ResponseWriter) error {
@@ -35,19 +61,28 @@ func (t *HTTPTransport) Proxy(ctx context.Context, target string, req *http.Requ
 		origDirector(r)
 		r.URL.Path = singleJoiningSlash(targetURL.Path, origPath)
 		r.Host = targetURL.Host
+		// 使用传入的 context，确保超时控制
+		*r = *r.WithContext(ctx)
 	}
 
-	proxy.Transport = &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		// 可以后续扩展更多配置
-	}
+	// 使用共享的 Transport，支持连接复用
+	proxy.Transport = t.getTransport()
 
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, e error) {
 		w.WriteHeader(http.StatusBadGateway)
 		w.Write([]byte("proxy error: " + e.Error()))
 	}
 
-	proxy.ServeHTTP(w, req)
+	// 使用 context 控制超时
+	proxy.ServeHTTP(w, req.WithContext(ctx))
+	return nil
+}
+
+// Close 关闭 Transport 并清理所有空闲连接
+func (t *HTTPTransport) Close() error {
+	if t.transport != nil {
+		t.transport.CloseIdleConnections()
+	}
 	return nil
 }
 

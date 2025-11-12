@@ -422,6 +422,14 @@ func (p *Proxy) ginProxyMiddleware() gin.HandlerFunc {
 func (p *Proxy) Close() error {
 	p.cancel()
 	p.wg.Wait()
+
+	// 关闭 transport
+	if closer, ok := p.transport.(interface{ Close() error }); ok {
+		if err := closer.Close(); err != nil {
+			p.config.Logger.Error("close transport failed: %v", err)
+		}
+	}
+
 	if p.backend != nil {
 		return p.backend.Close()
 	}
