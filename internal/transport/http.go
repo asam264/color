@@ -132,13 +132,12 @@ func (t *HTTPTransport) getOrCreateProxy(targetURL *url.URL) *httputil.ReversePr
 
 	// 自定义错误处理
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, e error) {
-		if t.enableLog {
-			// 详细记录错误信息，包括请求方法和路径
-			log.Printf("[HTTPTransport] Proxy error for %s %s -> %s: %v (context canceled: %v)",
-				r.Method, r.URL.Path, targetURL.String(), e, e == context.Canceled)
-		}
 		// 如果响应头还没写，才写错误响应
 		if w.Header().Get("Content-Type") == "" {
+			if t.enableLog {
+				log.Printf("[HTTPTransport] Proxy error for %s -> %s: %v",
+					r.URL.Path, targetURL.String(), e)
+			}
 			w.WriteHeader(http.StatusBadGateway)
 			w.Write([]byte("proxy error: " + e.Error()))
 		}
@@ -158,8 +157,6 @@ func (t *HTTPTransport) getOrCreateProxy(targetURL *url.URL) *httputil.ReversePr
 // Proxy 执行代理转发
 // 核心方法：根据 target 地址转发请求到后端服务
 func (t *HTTPTransport) Proxy(ctx context.Context, target string, req *http.Request, w http.ResponseWriter) error {
-	startTime := time.Now()
-
 	// 解析 target URL
 	targetURL, err := url.Parse(target)
 	if err != nil {
@@ -176,13 +173,6 @@ func (t *HTTPTransport) Proxy(ctx context.Context, target string, req *http.Requ
 	proxyCtx, cancel := context.WithTimeout(context.Background(), t.timeout)
 	defer cancel()
 
-	// 检查原 context 是否已被取消（用于日志记录）
-	if ctx != nil && ctx.Err() != nil {
-		if t.enableLog {
-			log.Printf("[HTTPTransport] Warning: original context already canceled: %v", ctx.Err())
-		}
-	}
-
 	// 获取或创建 ReverseProxy 实例
 	proxy := t.getOrCreateProxy(targetURL)
 
@@ -192,16 +182,6 @@ func (t *HTTPTransport) Proxy(ctx context.Context, target string, req *http.Requ
 		statusCode:     http.StatusOK, // 默认状态码
 	}
 
-	// 记录请求信息（添加请求追踪）
-	requestID := req.Header.Get("X-Request-ID")
-	if requestID == "" {
-		requestID = "unknown"
-	}
-	if t.enableLog {
-		log.Printf("[HTTPTransport] Proxying [%s] %s %s -> %s%s",
-			requestID, req.Method, req.URL.Path, targetURL.Host, req.URL.Path)
-	}
-
 	// 关键修复：对于 POST/PUT/PATCH 等有 body 的请求，确保 body 可以被读取
 	// httputil.ReverseProxy 会自动处理 body，但我们需要确保使用正确的 context
 	// 使用新的 context 而不是原请求的 context，避免被提前取消
@@ -209,14 +189,6 @@ func (t *HTTPTransport) Proxy(ctx context.Context, target string, req *http.Requ
 
 	// 执行代理转发
 	proxy.ServeHTTP(responseWriter, proxyReq)
-
-	// 记录响应信息
-	duration := time.Since(startTime)
-	if t.enableLog {
-		log.Printf("[HTTPTransport] Proxied [%s] %s %s -> %s%s [%d] in %v",
-			requestID, req.Method, req.URL.Path, targetURL.Host, req.URL.Path,
-			responseWriter.statusCode, duration)
-	}
 
 	return nil
 }
