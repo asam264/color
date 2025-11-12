@@ -26,20 +26,24 @@ func NewHTTPTransport(timeout time.Duration) *HTTPTransport {
 // getTransport 获取共享的 http.Transport 实例，配置连接池参数
 func (t *HTTPTransport) getTransport() *http.Transport {
 	t.once.Do(func() {
+		dialer := &net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+			// 不指定 LocalAddr，让系统自动分配端口，避免端口占用冲突
+			LocalAddr: nil,
+		}
 		t.transport = &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:   10 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			MaxIdleConns:          100,
-			MaxIdleConnsPerHost:   10,
-			IdleConnTimeout:       90 * time.Second,
+			Proxy:                 http.ProxyFromEnvironment,
+			DialContext:           dialer.DialContext,
+			MaxIdleConns:          50,
+			MaxIdleConnsPerHost:   5,
+			IdleConnTimeout:       30 * time.Second,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ExpectContinueTimeout: 1 * time.Second,
 			ResponseHeaderTimeout: t.timeout,
 			DisableKeepAlives:     false,
 			ForceAttemptHTTP2:     false,
+			DisableCompression:    false,
 		}
 	})
 	return t.transport

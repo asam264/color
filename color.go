@@ -402,8 +402,9 @@ func (p *Proxy) ginProxyMiddleware() gin.HandlerFunc {
 		// 使用策略选择目标
 		target, err := p.strategy.Select(c.Request.Context(), color)
 		if err != nil {
-			c.JSON(502, gin.H{"error": "route not found", "color": color})
-			c.Abort()
+			// 如果找不到匹配的 color 服务，继续正常处理请求，不进行转发
+			p.config.Logger.Info("route not found for color=%s, continuing normal request handling", color)
+			c.Next()
 			return
 		}
 
@@ -418,10 +419,35 @@ func (p *Proxy) ginProxyMiddleware() gin.HandlerFunc {
 	}
 }
 
-// Close 关闭资源
-func (p *Proxy) Close() error {
+// Shutdown 优雅退出：停止后台任务、删除自己的注册、关闭所有资源
+func (p *Proxy) Shutdown(ctx context.Context) error {
+	p.config.Logger.Info("shutting down proxy...")
+
+	// 停止后台任务
 	p.cancel()
-	p.wg.Wait()
+
+	// 如果启用了自动注册，删除自己的注册
+	if p.config.AutoRegister && p.config.LocalColor != "" {
+		if err := p.backend.Delete(ctx, p.config.LocalColor); err != nil {
+			p.config.Logger.Error("failed to delete self registration: %v", err)
+		} else {
+			p.config.Logger.Info("deleted self registration: color=%s", p.config.LocalColor)
+		}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		p.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-ctx.Done():
+		p.config.Logger.Error("shutdown timeout")
+		return ctx.Err()
+	case <-done:
+		// 后台任务已完成
+	}
 
 	// 关闭 transport
 	if closer, ok := p.transport.(interface{ Close() error }); ok {
@@ -430,10 +456,23 @@ func (p *Proxy) Close() error {
 		}
 	}
 
+	// 关闭 backend
 	if p.backend != nil {
-		return p.backend.Close()
+		if err := p.backend.Close(); err != nil {
+			p.config.Logger.Error("close backend failed: %v", err)
+			return err
+		}
 	}
+
+	p.config.Logger.Info("proxy shutdown completed")
 	return nil
+}
+
+// Close 关闭资源（兼容旧接口，内部调用 Shutdown）
+func (p *Proxy) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return p.Shutdown(ctx)
 }
 
 // 错误定义
