@@ -422,6 +422,13 @@ func (p *Proxy) ginProxyMiddleware() gin.HandlerFunc {
 		}
 		p.config.Logger.Info("received request [%s] with color=%s, path=%s", requestID, color, c.Request.URL.Path)
 
+		// 关键修复：如果请求的 color 和自己的颜色一样，直接处理，不再转发
+		if p.config.LocalColor != "" && color == p.config.LocalColor {
+			p.config.Logger.Info("color [%s] matches local color [%s], handling locally [%s]", requestID, color, p.config.LocalColor)
+			c.Next()
+			return
+		}
+
 		// 使用策略选择目标
 		target, err := p.strategy.Select(c.Request.Context(), color)
 		if err != nil {
