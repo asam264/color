@@ -192,10 +192,14 @@ func (t *HTTPTransport) Proxy(ctx context.Context, target string, req *http.Requ
 		statusCode:     http.StatusOK, // 默认状态码
 	}
 
-	// 记录请求信息
+	// 记录请求信息（添加请求追踪）
+	requestID := req.Header.Get("X-Request-ID")
+	if requestID == "" {
+		requestID = "unknown"
+	}
 	if t.enableLog {
-		log.Printf("[HTTPTransport] Proxying %s %s -> %s%s",
-			req.Method, req.URL.Path, targetURL.Host, req.URL.Path)
+		log.Printf("[HTTPTransport] Proxying [%s] %s %s -> %s%s",
+			requestID, req.Method, req.URL.Path, targetURL.Host, req.URL.Path)
 	}
 
 	// 关键修复：对于 POST/PUT/PATCH 等有 body 的请求，确保 body 可以被读取
@@ -209,8 +213,8 @@ func (t *HTTPTransport) Proxy(ctx context.Context, target string, req *http.Requ
 	// 记录响应信息
 	duration := time.Since(startTime)
 	if t.enableLog {
-		log.Printf("[HTTPTransport] Proxied %s %s -> %s%s [%d] in %v",
-			req.Method, req.URL.Path, targetURL.Host, req.URL.Path,
+		log.Printf("[HTTPTransport] Proxied [%s] %s %s -> %s%s [%d] in %v",
+			requestID, req.Method, req.URL.Path, targetURL.Host, req.URL.Path,
 			responseWriter.statusCode, duration)
 	}
 

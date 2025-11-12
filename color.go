@@ -393,6 +393,12 @@ func (p *Proxy) ginHandleDeleteRoute(c *gin.Context) {
 
 func (p *Proxy) ginProxyMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// 关键修复：检查请求是否已经被处理过（防止重复处理）
+		// 如果响应头已经写入，说明请求已经被处理，直接返回
+		if c.Writer.Written() {
+			return
+		}
+
 		// 获取 color header（不区分大小写）
 		color := c.GetHeader("color")
 		if color == "" {
@@ -409,30 +415,41 @@ func (p *Proxy) ginProxyMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		// 记录收到的 color header
-		p.config.Logger.Info("received request with color=%s, path=%s", color, c.Request.URL.Path)
+		// 记录收到的 color header（添加请求 ID 用于追踪）
+		requestID := c.GetHeader("X-Request-ID")
+		if requestID == "" {
+			requestID = fmt.Sprintf("%d", time.Now().UnixNano())
+		}
+		p.config.Logger.Info("received request [%s] with color=%s, path=%s", requestID, color, c.Request.URL.Path)
 
 		// 使用策略选择目标
 		target, err := p.strategy.Select(c.Request.Context(), color)
 		if err != nil {
 			// 如果找不到匹配的 color 服务，记录日志并继续正常处理请求
-			p.config.Logger.Info("route not found for color=%s, error=%v, continuing normal request handling", color, err)
+			p.config.Logger.Info("route not found [%s] for color=%s, error=%v, continuing normal request handling", requestID, color, err)
 			c.Next()
 			return
 		}
 
-		p.config.Logger.Info("routing color=%s to target=%s", color, target)
+		p.config.Logger.Info("routing [%s] color=%s to target=%s", requestID, color, target)
+
+		// 关键修复：在调用 Proxy 之前，先标记请求正在处理
+		// 使用 Abort() 确保即使 Proxy 内部出错，也不会继续后续处理
+		c.Abort()
 
 		// 使用传输层转发
+		// 注意：即使 Proxy 返回错误，我们也已经 Abort() 了，不会继续处理
 		if err := p.transport.Proxy(c.Request.Context(), target, c.Request, c.Writer); err != nil {
-			p.config.Logger.Error("proxy failed for color=%s, target=%s: %v", color, target, err)
-			c.JSON(502, gin.H{"error": "proxy failed", "detail": err.Error()})
-			c.Abort()
+			// 只有在响应还没写入时才写入错误响应
+			if !c.Writer.Written() {
+				p.config.Logger.Error("proxy failed [%s] for color=%s, target=%s: %v", requestID, color, target, err)
+				c.JSON(502, gin.H{"error": "proxy failed", "detail": err.Error()})
+			}
 			return
 		}
 
-		// 代理成功，终止后续处理
-		c.Abort()
+		// 代理成功，已经 Abort()，直接返回
+		return
 	}
 }
 
