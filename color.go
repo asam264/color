@@ -393,28 +393,45 @@ func (p *Proxy) ginHandleDeleteRoute(c *gin.Context) {
 
 func (p *Proxy) ginProxyMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// 获取 color header（不区分大小写）
 		color := c.GetHeader("color")
+		if color == "" {
+			// 尝试从其他可能的 header 名称获取（兼容性）
+			color = c.GetHeader("Color")
+			if color == "" {
+				color = c.GetHeader("COLOR")
+			}
+		}
+
+		// 如果没有 color header，继续正常处理
 		if color == "" {
 			c.Next()
 			return
 		}
 
+		// 记录收到的 color header
+		p.config.Logger.Info("received request with color=%s, path=%s", color, c.Request.URL.Path)
+
 		// 使用策略选择目标
 		target, err := p.strategy.Select(c.Request.Context(), color)
 		if err != nil {
-			// 如果找不到匹配的 color 服务，继续正常处理请求，不进行转发
-			p.config.Logger.Info("route not found for color=%s, continuing normal request handling", color)
+			// 如果找不到匹配的 color 服务，记录日志并继续正常处理请求
+			p.config.Logger.Info("route not found for color=%s, error=%v, continuing normal request handling", color, err)
 			c.Next()
 			return
 		}
 
+		p.config.Logger.Info("routing color=%s to target=%s", color, target)
+
 		// 使用传输层转发
 		if err := p.transport.Proxy(c.Request.Context(), target, c.Request, c.Writer); err != nil {
+			p.config.Logger.Error("proxy failed for color=%s, target=%s: %v", color, target, err)
 			c.JSON(502, gin.H{"error": "proxy failed", "detail": err.Error()})
 			c.Abort()
 			return
 		}
 
+		// 代理成功，终止后续处理
 		c.Abort()
 	}
 }
