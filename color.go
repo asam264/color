@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -159,20 +160,52 @@ func isFullURL(addr string) bool {
 	return len(addr) > 7 && (addr[:7] == "http://" || addr[:8] == "https://")
 }
 
-// getLocalIPv4 获取本机非回环 IPv4 地址
+// getLocalIPv4 返回最可能的真实 IPv4（排除虚拟网卡）
 func getLocalIPv4() string {
-	addrs, err := net.InterfaceAddrs()
+	ifaces, err := net.Interfaces()
 	if err != nil {
 		return ""
 	}
 
-	for _, addr := range addrs {
-		if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() {
-			if ipNet.IP.To4() != nil {
-				return ipNet.IP.String()
+	// 常见虚拟网卡关键词
+	virtualKeywords := []string{
+		"virtual", "vmware", "hyper-v", "docker", "veth", "wsl",
+		"vbox", "loopback", "tunnel", "tap", "tun", "ethernet default switch",
+	}
+
+	isVirtual := func(name string) bool {
+		lower := strings.ToLower(name)
+		for _, kw := range virtualKeywords {
+			if strings.Contains(lower, kw) {
+				return true
+			}
+		}
+		return false
+	}
+
+	for _, iface := range ifaces {
+		// 跳过虚拟网卡 + 关闭的网卡
+		if iface.Flags&net.FlagUp == 0 ||
+			iface.Flags&net.FlagLoopback != 0 ||
+			isVirtual(iface.Name) {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			if ipNet, ok := addr.(*net.IPNet); ok {
+				ip := ipNet.IP
+				if ipv4 := ip.To4(); ipv4 != nil {
+					return ipv4.String()
+				}
 			}
 		}
 	}
+
 	return ""
 }
 
