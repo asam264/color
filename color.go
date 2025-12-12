@@ -13,13 +13,16 @@ import (
 	"github.com/asam264/color/internal/strategy"
 	"github.com/asam264/color/internal/transport"
 	"github.com/gin-gonic/gin"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
 // Proxy 核心代理对象
 type Proxy struct {
-	backend   backend.Backend
-	transport transport.Transport
-	strategy  strategy.Strategy
+	backend  backend.Backend
+	http     transport.HTTPTransporter
+	grpc     transport.GRPCTransporter
+	strategy strategy.Strategy
 
 	config *Config
 	ctx    context.Context
@@ -33,7 +36,8 @@ type Config struct {
 	Backend backend.Backend
 
 	// 传输配置
-	Transport transport.Transport
+	HTTPTransport transport.HTTPTransporter
+	GRPCTransport transport.GRPCTransporter
 
 	// 路由策略
 	Strategy strategy.Strategy
@@ -98,14 +102,28 @@ func WithBackend(b backend.Backend) Option {
 // WithHTTPTransport 使用 HTTP 传输
 func WithHTTPTransport(timeout time.Duration) Option {
 	return func(c *Config) {
-		c.Transport = transport.NewHTTPTransport(timeout)
+		c.HTTPTransport = transport.NewHTTPTransport(timeout)
 	}
 }
 
-// WithTransport 自定义传输层
-func WithTransport(t transport.Transport) Option {
+// WithGRPCTransport 使用 gRPC 传输
+func WithGRPCTransport(timeout time.Duration) Option {
 	return func(c *Config) {
-		c.Transport = t
+		c.GRPCTransport = transport.NewGRPCTransport(timeout)
+	}
+}
+
+// WithTransport 自定义 HTTP 传输层
+func WithTransport(t transport.HTTPTransporter) Option {
+	return func(c *Config) {
+		c.HTTPTransport = t
+	}
+}
+
+// WithGRPCTransporter 自定义 gRPC 传输层
+func WithGRPCTransporter(t transport.GRPCTransporter) Option {
+	return func(c *Config) {
+		c.GRPCTransport = t
 	}
 }
 
@@ -235,8 +253,11 @@ func New(opts ...Option) (*Proxy, error) {
 	if cfg.Backend == nil {
 		return nil, ErrBackendRequired
 	}
-	if cfg.Transport == nil {
-		cfg.Transport = transport.NewHTTPTransport(30 * time.Second)
+	if cfg.HTTPTransport == nil {
+		cfg.HTTPTransport = transport.NewHTTPTransport(30 * time.Second)
+	}
+	if cfg.GRPCTransport == nil {
+		cfg.GRPCTransport = transport.NewGRPCTransport(30 * time.Second)
 	}
 	if cfg.Strategy == nil {
 		cfg.Strategy = strategy.NewSimpleStrategy(cfg.Backend)
@@ -245,12 +266,13 @@ func New(opts ...Option) (*Proxy, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	p := &Proxy{
-		backend:   cfg.Backend,
-		transport: cfg.Transport,
-		strategy:  cfg.Strategy,
-		config:    cfg,
-		ctx:       ctx,
-		cancel:    cancel,
+		backend:  cfg.Backend,
+		http:     cfg.HTTPTransport,
+		grpc:     cfg.GRPCTransport,
+		strategy: cfg.Strategy,
+		config:   cfg,
+		ctx:      ctx,
+		cancel:   cancel,
 	}
 
 	// 启动后台任务
@@ -282,6 +304,82 @@ func (p *Proxy) AttachGin(engine *gin.Engine) {
 	engine.Use(p.ginProxyMiddleware())
 
 	p.config.Logger.Info("attached to Gin engine")
+}
+
+// GetGRPCUnaryClientInterceptor 获取 gRPC 客户端拦截器
+// 用于在创建 gRPC client 时注入，实现自动的 color 路由转发
+func (p *Proxy) GetGRPCUnaryClientInterceptor() grpc.UnaryClientInterceptor {
+	return func(
+		ctx context.Context,
+		method string,
+		req, reply interface{},
+		cc *grpc.ClientConn,
+		invoker grpc.UnaryInvoker,
+		opts ...grpc.CallOption,
+	) error {
+		// 从 outgoing context 提取 metadata
+		md, ok := metadata.FromOutgoingContext(ctx)
+		if !ok {
+			// 尝试从 incoming context 提取（服务端收到的请求）
+			if mdIn, ok := metadata.FromIncomingContext(ctx); ok {
+				// 将 incoming metadata 转为 outgoing
+				ctx = metadata.NewOutgoingContext(ctx, mdIn)
+				md = mdIn
+			} else {
+				// 没有 metadata，正常调用
+				return invoker(ctx, method, req, reply, cc, opts...)
+			}
+		}
+
+		// 获取 color
+		colorValues := md.Get("color")
+		if len(colorValues) == 0 {
+			// 没有 color，正常调用
+			return invoker(ctx, method, req, reply, cc, opts...)
+		}
+
+		color := colorValues[0]
+
+		// color与本地一直，直接调用不转发
+		if p.config.LocalColor != "" && color == p.config.LocalColor {
+			return invoker(ctx, method, req, reply, cc, opts...)
+		}
+
+		target, err := p.strategy.Select(ctx, color)
+		if err != nil {
+			// 找不到目标，按正常流程处理
+			p.config.Logger.Info("gRPC color %s not found, fallback to normal call", color)
+			return invoker(ctx, method, req, reply, cc, opts...)
+		}
+
+		// 使用 GRPCTransport 转发到目标
+		p.config.Logger.Info("forwarding gRPC call: method=%s, color=%s, target=%s", method, color, target)
+
+		return p.grpc.Proxy(ctx, target, method, req, reply, opts...)
+	}
+}
+
+// GetGRPCUnaryServerInterceptor 获取 gRPC 服务端拦截器
+func (p *Proxy) GetGRPCUnaryServerInterceptor() grpc.UnaryServerInterceptor {
+	return func(
+		ctx context.Context,
+		req interface{},
+		info *grpc.UnaryServerInfo,
+		handler grpc.UnaryHandler,
+	) (interface{}, error) {
+		// 从 incoming metadata 提取 color
+		if md, ok := metadata.FromIncomingContext(ctx); ok {
+			if colorValues := md.Get("color"); len(colorValues) > 0 {
+				// 将 color 写入 outgoing context
+				ctx = metadata.AppendToOutgoingContext(ctx, "color", colorValues[0])
+
+				p.config.Logger.Info("gRPC server received color=%s for method=%s", colorValues[0], info.FullMethod)
+			}
+		}
+
+		// 继续处理请求
+		return handler(ctx, req)
+	}
 }
 
 // startBackgroundTasks 启动后台任务
@@ -468,7 +566,7 @@ func (p *Proxy) ginProxyMiddleware() gin.HandlerFunc {
 
 		// 使用传输层转发
 		// 注意：即使 Proxy 返回错误，我们也已经 Abort() 了，不会继续处理
-		if err := p.transport.Proxy(c.Request.Context(), target, c.Request, c.Writer); err != nil {
+		if err := p.http.Proxy(c.Request.Context(), target, c.Request, c.Writer); err != nil {
 			// 只有在响应还没写入时才写入错误响应
 			if !c.Writer.Written() {
 				p.config.Logger.Error("proxy failed for color=%s, target=%s: %v", color, target, err)
@@ -512,10 +610,17 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 		// 后台任务已完成
 	}
 
-	// 关闭 transport
-	if closer, ok := p.transport.(interface{ Close() error }); ok {
-		if err := closer.Close(); err != nil {
-			p.config.Logger.Error("close transport failed: %v", err)
+	// 关闭 HTTP transport
+	if p.http != nil {
+		if err := p.http.Close(); err != nil {
+			p.config.Logger.Error("close http transport failed: %v", err)
+		}
+	}
+
+	// 关闭 gRPC transport
+	if p.grpc != nil {
+		if err := p.grpc.Close(); err != nil {
+			p.config.Logger.Error("close grpc transport failed: %v", err)
 		}
 	}
 
